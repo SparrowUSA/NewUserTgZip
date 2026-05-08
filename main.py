@@ -5,7 +5,7 @@ import traceback
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession 
 from dotenv import load_dotenv
-from utils import stream_to_bunny_vault
+from utils import stream_to_bunny_vault, get_zip_filenames
 
 load_dotenv()
 
@@ -24,60 +24,61 @@ async def worker():
     while True:
         msg_id, file_name, chat_id = await queue.get()
         try:
-            # Fetch message from the specific chat it came from
             msg = await client.get_messages(chat_id, ids=msg_id)
             status = await client.send_message(chat_id, f"🛠 **Starting Stream:** `{file_name}`...")
-            
             video_guid, error = await stream_to_bunny_vault(client, msg, file_name, BUNNY_CFG, status)
             
             if video_guid:
-                play_link = f"https://iframe.mediadelivery.net/play/{BUNNY_CFG['LIBRARY_ID']}/{video_guid}"
-                await status.edit(f"✅ **Upload Complete!**\n\n🔗 [Watch Lecture]({play_link})")
+                link = f"https://iframe.mediadelivery.net/play/{BUNNY_CFG['LIBRARY_ID']}/{video_guid}"
+                await status.edit(f"✅ **Vaulted!**\n\n🔗 [Watch Now]({link})")
             else:
-                await status.edit(f"❌ **Transfer Failed!**\n\n**Error Details:**\n{error}")
+                await status.edit(f"❌ **Error:** {error}")
         except Exception:
-            err_log = traceback.format_exc()
-            await client.send_message(chat_id, f"⚠️ **Worker Crash!**\n```{err_log}```")
+            await client.send_message(chat_id, f"⚠️ **Crash:**\n```{traceback.format_exc()}```")
         finally:
             gc.collect()
             queue.task_done()
 
-# REMOVED 'outgoing=True' so ANYONE'S message triggers the bot
 @client.on(events.NewMessage)
 async def zip_handler(event):
-    # Log details to Render console to see WHO is sending
-    sender = await event.get_sender()
-    sender_name = getattr(sender, 'first_name', 'Unknown')
-    print(f"DEBUG: Message from {sender_name} (ID: {event.sender_id}) in Chat: {event.chat_id}")
-
     if event.message.file and event.message.file.ext == ".zip":
-        print(f"DEBUG: ZIP detected from {sender_name}")
-        try:
-            await event.reply(
-                f"📂 **ZIP Detected, {sender_name}!**\nSelect the file to stream:",
-                buttons=[
-                    # Note: These are placeholders. You can add logic to 'peek' inside here.
-                    [Button.inline("Lecture 01", "Lecture_01.mp4")],
-                    [Button.inline("Lecture 02", "Lecture_02.mp4")]
-                ]
-            )
-        except Exception as e:
-            print(f"DEBUG: Failed to reply: {e}")
+        status_peek = await event.reply("🔍 **Peeking inside ZIP...**")
+        files = await get_zip_filenames(client, event.message)
+        
+        # Filter for video files only
+        videos = [f for f in files if f.lower().endswith(('.mp4', '.mkv', '.ts', '.mov'))]
+        
+        if not videos:
+            await status_peek.edit("❌ No video files found in this ZIP.")
+            return
 
-@client.on(events.CallbackQuery())
-async def callback(event):
-    file_name = event.data.decode('utf-8')
-    # Pass the chat_id so the worker knows where to send the link
-    await queue.put((event.message_id, file_name, event.chat_id))
-    await event.answer("Added to Queue! 🕒")
+        # Create Text Buttons (2 per row)
+        btn_rows = [videos[i:i + 2] for i in range(0, len(videos), 2)]
+        keyboard = [[Button.text(name, resize=True, single_use=True)] for row in btn_rows for name in row]
+
+        await client.send_message(
+            event.chat_id,
+            f"✅ **Found {len(videos)} videos.** Pick one to vault:",
+            buttons=keyboard
+        )
+        await status_peek.delete()
+
+@client.on(events.NewMessage)
+async def handle_button_click(event):
+    if event.text.lower().endswith(('.mp4', '.mkv', '.ts', '.mov')):
+        file_name = event.text
+        await event.reply(f"🚀 **Added to Queue:** `{file_name}`", buttons=Button.clear())
+        
+        # Find the original ZIP message in the last 15 messages
+        async for msg in client.iter_messages(event.chat_id, limit=15):
+            if msg.file and msg.file.ext == ".zip":
+                await queue.put((msg.id, file_name, event.chat_id))
+                break
 
 async def main():
     await client.start()
-    print("Userbot is ACTIVE and listening to EVERYONE.")
-    
-    # Startup check
-    await client.send_message('me', "👋 **System Online.** Listening for ZIPs from any source.")
-    
+    print("Userbot is ACTIVE.")
+    await client.send_message('me', "👋 **System Online.** Forward a ZIP to start.")
     asyncio.create_task(worker())
     await client.run_until_disconnected()
 
