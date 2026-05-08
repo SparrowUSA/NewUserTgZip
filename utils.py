@@ -6,7 +6,6 @@ import time
 import threading
 import queue
 import requests
-import io
 from stream_unzip import stream_unzip
 
 class Progress:
@@ -31,58 +30,59 @@ class Progress:
 
 async def get_zip_filenames(client, message):
     """
-    Optimized Peeker: Reads only enough of the ZIP to get the file list.
-    No threads/queues here to prevent deadlocks.
+    Threaded Peeker: Uses a queue to bridge Async Telegram and Sync stream-unzip.
+    This fixes the 'Event loop already running' error.
     """
     filenames = []
-    chunk_count = 0
+    data_queue = queue.Queue(maxsize=1) 
     
-    # We create a simple generator that pulls from Telegram
-    async def telegram_stream():
-        async for chunk in client.iter_download(message.media):
+    def sync_source():
+        while True:
+            chunk = data_queue.get()
+            if chunk is None: break
             yield chunk
 
-    def sync_gen(async_gen):
-        loop = asyncio.get_event_loop()
-        it = async_gen.__aiter__()
-        while True:
-            try:
-                yield loop.run_until_complete(it.__anext__())
-            except StopAsyncIteration:
-                break
+    def unzip_thread():
+        try:
+            # stream_unzip works here because it's in a standard thread
+            for name, size, chunks in stream_unzip(sync_source()):
+                filenames.append(name.decode('utf-8'))
+                # Drain chunks to get to next header
+                for _ in chunks: pass
+                if len(filenames) >= 100: break
+        except Exception as e:
+            print(f"THREAD DEBUG: Peek Error: {e}")
+        finally:
+            # Clear queue to unblock the main loop
+            while not data_queue.empty(): data_queue.get()
+
+    t = threading.Thread(target=unzip_thread, daemon=True)
+    t.start()
 
     try:
-        # We only look at the first 5MB of the ZIP for peeking
-        # This is usually plenty for the header/file list
-        for name, size, chunks in stream_unzip(sync_gen(telegram_stream())):
-            fname = name.decode('utf-8')
-            filenames.append(fname)
-            # Drain the file chunks so we can see the next header
-            for _ in chunks: pass 
-            
-            if len(filenames) >= 50: break
-    except Exception as e:
-        print(f"PEEK LOG: {e}")
+        # Pull from Telegram (Async) and put into Queue (Sync)
+        async for chunk in client.iter_download(message.media):
+            data_queue.put(chunk)
+            if not t.is_alive(): break
+    finally:
+        data_queue.put(None)
+        t.join(timeout=5)
     
     return filenames
 
 async def stream_to_bunny_vault(client, message, target_file, b_cfg, status_msg):
     """
-    Threaded upload for the actual file transfer. 
-    Added safety timeouts to prevent hanging.
+    Threaded Uploader: Standardized to match the Peeker logic.
     """
-    data_queue = queue.Queue(maxsize=5) # Increased buffer
+    data_queue = queue.Queue(maxsize=5)
     progress = Progress(client, status_msg, target_file)
     result = {"guid": None, "error": None}
 
     def sync_source():
         while True:
-            try:
-                chunk = data_queue.get(timeout=30) # Prevent infinite hang
-                if chunk is None: break
-                yield chunk
-            except queue.Empty:
-                break
+            chunk = data_queue.get()
+            if chunk is None: break
+            yield chunk
 
     def unzip_thread():
         try:
@@ -97,10 +97,7 @@ async def stream_to_bunny_vault(client, message, target_file, b_cfg, status_msg)
         except Exception as e:
             result["error"] = str(e)
         finally:
-            # Clean up queue
-            try:
-                while not data_queue.empty(): data_queue.get_nowait()
-            except: pass
+            while not data_queue.empty(): data_queue.get()
 
     # 1. Create Video
     async with aiohttp.ClientSession() as session:
