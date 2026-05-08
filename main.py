@@ -65,9 +65,9 @@ async def zip_handler(event):
             return
 
         # Filter out folder-only entries
-        files_to_show = [f for f in all_paths if not f.endswith('/')]
+        files_only = [f for f in all_paths if not f.endswith('/')]
 
-        if not files_only := files_to_show:
+        if not files_only:
             await status_peek.edit("❌ No files found inside.")
             return
 
@@ -89,9 +89,10 @@ async def zip_handler(event):
 @client.on(events.NewMessage(incoming=True, outgoing=True))
 async def handle_button_click(event):
     """Detects when a file path button is pressed."""
+    # Logic to identify if text is a file path button
     if "." in event.text and not event.text.startswith('/'):
         file_path = event.text
-        # Safety: Check if we can find the ZIP in recent history
+        # Search back for the original ZIP
         async for msg in client.iter_messages(event.chat_id, limit=20):
             if msg.file and msg.file.ext == ".zip":
                 await event.reply(f"🚀 **Added to Queue:** `{file_path.split('/')[-1]}`", buttons=Button.clear())
@@ -103,7 +104,7 @@ async def main():
     me = await client.get_me()
     print(f"✅ Userbot is ACTIVE as @{me.username}")
     
-    # Notify yourself that it's up
+    # Notify Saved Messages
     await client.send_message('me', "👋 **System Online.** Listening for ZIPs.")
     
     asyncio.create_task(worker())
