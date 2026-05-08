@@ -1,13 +1,12 @@
 import gc
 import aiohttp
+import asyncio
 import traceback
 import time
 from stream_unzip import stream_unzip
 
 class Progress:
-    """
-    Handles 10-second status updates to prevent Telegram rate-limiting.
-    """
+    """Handles 10-second status updates to prevent Telegram rate-limiting."""
     def __init__(self, client, status_msg, file_name):
         self.client = client
         self.status_msg = status_msg
@@ -28,22 +27,42 @@ class Progress:
             except: 
                 pass
 
+def to_sync_generator(async_gen, loop):
+    """
+    Bridge: Converts Telegram's Async Generator into a Sync Generator
+    so stream_unzip can process it without __aiter__ errors.
+    """
+    def sync_gen():
+        try:
+            # We manually iterate the async generator using the existing loop
+            it = async_gen.__aiter__()
+            while True:
+                try:
+                    yield loop.run_until_complete(it.__anext__())
+                except StopAsyncIteration:
+                    break
+        except Exception as e:
+            print(f"DEBUG: Sync Wrapper Error: {e}")
+    return sync_gen()
+
 async def get_zip_filenames(client, message):
-    """
-    Peeks at ZIP headers to list files without downloading the archive.
-    """
+    """Peeks at ZIP headers to list files without downloading the archive."""
     filenames = []
+    loop = asyncio.get_event_loop()
     
     async def telegram_generator():
         async for chunk in client.iter_download(message.media):
             yield chunk
 
     try:
-        # FIXED: Must use 'async for' for asynchronous generators
-        async for name, size, unzipped_chunks in stream_unzip(telegram_generator()):
+        # Wrap the async telegram source into a sync-compatible generator
+        sync_source = to_sync_generator(telegram_generator(), loop)
+        
+        # Now stream_unzip works with a standard 'for' loop
+        for name, size, unzipped_chunks in stream_unzip(sync_source):
             filenames.append(name.decode('utf-8'))
-            # Drain the chunks for this file so we can reach the next header
-            async for _ in unzipped_chunks:
+            # Still need to drain the chunks to move to the next header
+            for _ in unzipped_chunks:
                 pass
             if len(filenames) >= 15: 
                 break 
@@ -53,9 +72,8 @@ async def get_zip_filenames(client, message):
     return filenames
 
 async def stream_to_bunny_vault(client, message, target_file, b_cfg, status_msg):
-    """
-    Direct pipe from Telegram to Bunny.net via Render RAM.
-    """
+    """Direct pipe from Telegram to Bunny.net via Render RAM."""
+    loop = asyncio.get_event_loop()
     try:
         lib_id = b_cfg['LIBRARY_ID']
         api_key = b_cfg['STREAM_KEY']
@@ -75,7 +93,7 @@ async def stream_to_bunny_vault(client, message, target_file, b_cfg, status_msg)
                     return None, f"Bunny Create Error: {resp.status}"
                 video_guid = (await resp.json())['guid']
 
-            # STEP 2: Generator for Telegram Download
+            # STEP 2: Async Generator for Telegram
             async def telegram_generator():
                 bytes_sent = 0
                 async for chunk in client.iter_download(message.media):
@@ -83,22 +101,24 @@ async def stream_to_bunny_vault(client, message, target_file, b_cfg, status_msg)
                     bytes_sent += len(chunk)
                     await progress.update(bytes_sent)
 
-            # STEP 3: Find and Pipe specific file
+            # STEP 3: Convert to Sync for stream_unzip and Pipe
             found = False
-            # FIXED: Must use 'async for' here as well
-            async for name, size, unzipped_chunks in stream_unzip(telegram_generator()):
+            sync_source = to_sync_generator(telegram_generator(), loop)
+            
+            for name, size, unzipped_chunks in stream_unzip(sync_source):
                 if name.decode('utf-8') == target_file:
                     found = True
                     upload_url = f"https://video.bunnycdn.com/library/{lib_id}/videos/{video_guid}"
                     up_headers = {"AccessKey": api_key, "accept": "application/json"}
                     
+                    # session.put accepts the unzipped_chunks generator directly
                     async with session.put(upload_url, data=unzipped_chunks, headers=up_headers) as up_resp:
                         gc.collect()
                         if up_resp.status == 200:
                             return video_guid, None
                         return None, f"Bunny Upload Error: {up_resp.status}"
                 else:
-                    async for _ in unzipped_chunks: 
+                    for _ in unzipped_chunks: 
                         pass 
             
             if not found:
