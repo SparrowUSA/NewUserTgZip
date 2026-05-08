@@ -30,49 +30,60 @@ class Progress:
 
 async def get_zip_filenames(client, message):
     """
-    Threaded Peeker: Uses a queue to bridge Async Telegram and Sync stream-unzip.
-    This fixes the 'Event loop already running' error.
+    THREADED PEEKER:
+    Lists all files in a ZIP instantly by reading only the first 10MB.
     """
     filenames = []
-    data_queue = queue.Queue(maxsize=1) 
+    data_queue = queue.Queue(maxsize=10) 
     
     def sync_source():
         while True:
-            chunk = data_queue.get()
-            if chunk is None: break
-            yield chunk
+            try:
+                # 20s timeout ensures we never hang if the stream breaks
+                chunk = data_queue.get(timeout=20)
+                if chunk is None: break
+                yield chunk
+            except queue.Empty:
+                break
 
     def unzip_thread():
         try:
-            # stream_unzip works here because it's in a standard thread
             for name, size, chunks in stream_unzip(sync_source()):
-                filenames.append(name.decode('utf-8'))
-                # Drain chunks to get to next header
+                fname = name.decode('utf-8')
+                filenames.append(fname)
+                # Drain chunks to find the next file header
                 for _ in chunks: pass
+                # Stop if we hit 100 files to keep the list manageable
                 if len(filenames) >= 100: break
         except Exception as e:
-            print(f"THREAD DEBUG: Peek Error: {e}")
+            print(f"DEBUG: Peek Thread Error: {e}")
         finally:
-            # Clear queue to unblock the main loop
-            while not data_queue.empty(): data_queue.get()
+            # Prevent blocking the main loop
+            while not data_queue.empty():
+                try: data_queue.get_nowait()
+                except: break
 
     t = threading.Thread(target=unzip_thread, daemon=True)
     t.start()
 
     try:
-        # Pull from Telegram (Async) and put into Queue (Sync)
+        bytes_peeked = 0
         async for chunk in client.iter_download(message.media):
-            data_queue.put(chunk)
             if not t.is_alive(): break
+            data_queue.put(chunk)
+            bytes_peeked += len(chunk)
+            # PEAK CAP: Only download first 10MB to get file list
+            if bytes_peeked > 10 * 1024 * 1024: break 
     finally:
         data_queue.put(None)
-        t.join(timeout=5)
+        t.join(timeout=2)
     
     return filenames
 
 async def stream_to_bunny_vault(client, message, target_file, b_cfg, status_msg):
     """
-    Threaded Uploader: Standardized to match the Peeker logic.
+    THREADED UPLOADER:
+    Streams data from Telegram -> Queue -> stream_unzip -> Bunny.net.
     """
     data_queue = queue.Queue(maxsize=5)
     progress = Progress(client, status_msg, target_file)
@@ -80,9 +91,12 @@ async def stream_to_bunny_vault(client, message, target_file, b_cfg, status_msg)
 
     def sync_source():
         while True:
-            chunk = data_queue.get()
-            if chunk is None: break
-            yield chunk
+            try:
+                chunk = data_queue.get(timeout=60) # 1 minute timeout for slow downloads
+                if chunk is None: break
+                yield chunk
+            except queue.Empty:
+                break
 
     def unzip_thread():
         try:
@@ -97,9 +111,11 @@ async def stream_to_bunny_vault(client, message, target_file, b_cfg, status_msg)
         except Exception as e:
             result["error"] = str(e)
         finally:
-            while not data_queue.empty(): data_queue.get()
+            while not data_queue.empty():
+                try: data_queue.get_nowait()
+                except: break
 
-    # 1. Create Video
+    # 1. Create Video Object in Bunny
     async with aiohttp.ClientSession() as session:
         create_url = f"https://video.bunnycdn.com/library/{b_cfg['LIBRARY_ID']}/videos"
         async with session.post(create_url, json={"title": target_file.split('/')[-1]}, 
@@ -107,11 +123,11 @@ async def stream_to_bunny_vault(client, message, target_file, b_cfg, status_msg)
             if resp.status != 200: return None, f"Create Error: {resp.status}"
             result["guid"] = (await resp.json())['guid']
 
-    # 2. Start Worker
+    # 2. Start the processing thread
     t = threading.Thread(target=unzip_thread, daemon=True)
     t.start()
 
-    # 3. Stream from Telegram
+    # 3. Feed the thread with data from Telegram
     bytes_sent = 0
     try:
         async for chunk in client.iter_download(message.media):
