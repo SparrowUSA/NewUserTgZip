@@ -1,120 +1,112 @@
 import os
 import asyncio
-import gc
+import zipfile
 import traceback
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession 
 from dotenv import load_dotenv
-from utils import stream_to_bunny_vault, get_zip_filenames
+from utils import upload_local_file_to_bunny
 
 load_dotenv()
 
-# --- CONFIG ---
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION = os.getenv("SESSION")
-LOG_CHANNEL = -1003705284928
+client = TelegramClient(StringSession(os.getenv("SESSION")), int(os.getenv("API_ID")), os.getenv("API_HASH"))
 BUNNY_CFG = {
     "STREAM_KEY": os.getenv("BUNNY_STREAM_API_KEY"),
     "LIBRARY_ID": os.getenv("BUNNY_LIBRARY_ID"),
 }
 
-client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-queue = asyncio.Queue()
+# Stores { chat_id: { "zip": path, "map": { "1.1": "folder/file.ts" } } }
+active_sessions = {}
 
-async def send_log(text):
-    if not LOG_CHANNEL: return
-    try: await client.send_message(LOG_CHANNEL, f"📝 **SYSTEM LOG**\n\n{text}", silent=True)
-    except: pass
+def build_tree(paths):
+    """Converts flat paths into a nested numbered dictionary."""
+    tree = {}
+    for path in paths:
+        parts = path.split('/')
+        current = tree
+        for part in parts:
+            if part not in current:
+                current[part] = {}
+            current = current[part]
+    return tree
 
-async def zip_handler(event):
-    """Scans ZIP and sends a split text list of all files."""
-    try:
-        status_peek = await event.reply("🔍 **Scanning ZIP (Text List Mode)...**")
-        all_paths = await get_zip_filenames(client, event.message)
-        
-        if not all_paths:
-            await status_peek.edit("❌ ZIP is empty or unreadable.")
-            return
+def format_tree(tree, prefix="", number_prefix=""):
+    """Recursively builds the text list with numbers like 1.1.2"""
+    lines = []
+    for i, (name, subtree) in enumerate(tree.items(), 1):
+        current_number = f"{number_prefix}{i}"
+        if not subtree:  # It's a file
+            lines.append(f"{prefix}{current_number}. `{name}`")
+        else:  # It's a folder
+            lines.append(f"{prefix}{current_number}. 📂 **{name}**")
+            lines.extend(format_tree(subtree, prefix + "    ", current_number + "."))
+    return lines
 
-        files_only = [f for f in all_paths if not f.endswith('/')]
-        if not files_only:
-            await status_peek.edit("❌ No files found inside.")
-            return
-
-        # Prepare the list message
-        header = f"📦 **Archive Contents ({len(files_only)} items):**\n"
-        header += "━━━━━━━━━━━━━━━━━━━━\n"
-        header += "👉 *Copy & Paste the exact name of the file you want to vault:*\n\n"
-        
-        full_list = ""
-        for i, file_path in enumerate(files_only, 1):
-            full_list += f"`{file_path}`\n\n"
-
-        # Telegram limit is 4096 characters per message
-        # We split the list into chunks of 3500 to stay safe
-        limit = 3500
-        parts = [full_list[i:i+limit] for i in range(0, len(full_list), limit)]
-
-        await status_peek.delete()
-        
-        # Send the first part with the header
-        await event.respond(header + parts[0])
-        
-        # Send subsequent parts if they exist
-        for part in parts[1:]:
-            await event.respond(part)
-
-    except Exception as e:
-        await send_log(f"⚠️ **Zip List Error:**\n```{traceback.format_exc()}```")
-
-async def worker():
-    while True:
-        msg_id, file_path, chat_id = await queue.get()
-        try:
-            msg = await client.get_messages(chat_id, ids=msg_id)
-            status = await client.send_message(chat_id, f"🛠 **Processing:** `{file_path.split('/')[-1]}`...")
-            
-            await send_log(f"🚀 **Vaulting:** `{file_path}`")
-            video_guid, error = await stream_to_bunny_vault(client, msg, file_path, BUNNY_CFG, status)
-            
-            if video_guid:
-                link = f"https://iframe.mediadelivery.net/play/{BUNNY_CFG['LIBRARY_ID']}/{video_guid}"
-                await status.edit(f"✅ **Vaulted!**\n\n🔗 [Watch Now]({link})")
-                await send_log(f"✅ **Success:** `{file_path}`\n🔗 {link}")
-            else:
-                await status.edit(f"❌ **Error:** {error}")
-                await send_log(f"❌ **Failed:** `{file_path}`\nReason: {error}")
-        except Exception:
-            await send_log(f"⚠️ **Worker Error:**\n```{traceback.format_exc()}```")
-        finally:
-            gc.collect()
-            queue.task_done()
+def get_path_map(tree, number_prefix="", current_path=""):
+    """Maps the '1.1.2' string back to the actual 'folder/file.ts' path."""
+    mapping = {}
+    for i, (name, subtree) in enumerate(tree.items(), 1):
+        num = f"{number_prefix}{i}"
+        new_path = f"{current_path}/{name}" if current_path else name
+        if not subtree:
+            mapping[num] = new_path
+        else:
+            mapping.update(get_path_map(subtree, num + ".", new_path))
+    return mapping
 
 @client.on(events.NewMessage(incoming=True, outgoing=True))
-async def main_handler(event):
-    # 1. Detect ZIP
+async def handler(event):
+    # 1. SCAN ZIP
     if event.message.file and event.message.file.ext == ".zip":
-        await zip_handler(event)
-        return
-
-    # 2. Detect Paste (Match any string that looks like a file path from the list)
-    # We ignore commands (starting with /)
-    if not event.text.startswith('/') and len(event.text) > 3:
-        target_path = event.text.strip().strip('`') # Clean backticks if user copied them
+        status = await event.reply("📥 **GitHub Action: Downloading large ZIP...**")
+        local_zip = await event.download_media("current_vault.zip")
         
-        # Search for the original ZIP in the last 50 messages
-        async for msg in client.iter_messages(event.chat_id, limit=50):
-            if msg.file and msg.file.ext == ".zip":
-                await event.reply(f"📥 **Added to Queue:** `{target_path.split('/')[-1]}`")
-                await queue.put((msg.id, target_path, event.chat_id))
-                return
+        with zipfile.ZipFile(local_zip, 'r') as z:
+            # Clean list (remove hidden files like __MACOSX)
+            paths = [f for f in z.namelist() if not f.startswith('__') and not f.endswith('/')]
+            
+            tree = build_tree(paths)
+            tree_text = format_tree(tree)
+            path_map = get_path_map(tree)
+            
+            active_sessions[event.chat_id] = {"zip": local_zip, "map": path_map}
+            
+            header = "🌳 **File Tree Structure:**\n━━━━━━━━━━━━━━━━━━━━\n"
+            body = "\n".join(tree_text)
+            footer = "\n\n🔢 **Type the number(s) to upload (e.g., 1.1 or 2.1.3)**"
+            
+            full_msg = header + body + footer
+            for x in range(0, len(full_msg), 4000):
+                await event.respond(full_msg[x:x+4000])
+        await status.delete()
+
+    # 2. PROCESS NUMBER INPUT
+    elif event.text and event.chat_id in active_sessions:
+        session = active_sessions[event.chat_id]
+        targets = event.text.split() # Supports multiple: "1.1 2.2"
+        
+        for num in targets:
+            clean_num = num.strip('.')
+            if clean_num in session['map']:
+                real_path = session['map'][clean_num]
+                status = await event.reply(f"🚀 **Vaulting:** `{real_path}`")
+                
+                with zipfile.ZipFile(session['zip'], 'r') as z:
+                    ext_path = z.extract(real_path, "temp_out")
+                
+                guid, err = await upload_local_file_to_bunny(ext_path, real_path, BUNNY_CFG)
+                if guid:
+                    await status.edit(f"✅ **Vaulted {clean_num}:**\n`https://iframe.mediadelivery.net/play/{BUNNY_CFG['LIBRARY_ID']}/{guid}`")
+                else:
+                    await status.edit(f"❌ Error on {clean_num}: {err}")
+                
+                if os.path.exists(ext_path): os.remove(ext_path)
 
 async def main():
     await client.start()
-    print("✅ Userbot is ACTIVE.")
-    asyncio.create_task(worker())
+    print("✅ Tree-Bot Active on GitHub...")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
+    import asyncio
     asyncio.run(main())
