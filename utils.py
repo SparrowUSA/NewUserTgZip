@@ -3,29 +3,51 @@ import requests
 import aiohttp
 
 async def upload_local_file_to_bunny(local_path, internal_path, b_cfg):
+    """
+    Uploads a file from GitHub SSD to Bunny.net Stream.
+    Uses a 2-step process: Create Video -> Upload Content.
+    """
+    # Clean name for the Bunny.net dashboard (removes folder paths)
     display_name = internal_path.split('/')[-1]
     
-    # 1. Create Video Entry
+    # --- STEP 1: CREATE VIDEO ENTRY ---
+    # We use aiohttp for the quick metadata call
     async with aiohttp.ClientSession() as session:
-        url = f"https://video.bunnycdn.com/library/{b_cfg['LIBRARY_ID']}/videos"
+        create_url = f"https://video.bunnycdn.com/library/{b_cfg['LIBRARY_ID']}/videos"
         headers = {
             "AccessKey": b_cfg['STREAM_KEY'],
             "Content-Type": "application/json",
             "accept": "application/json"
         }
-        async with session.post(url, json={"title": display_name}, headers=headers) as resp:
-            if resp.status != 200:
-                return None, f"Create Error: {resp.status}"
-            data = await resp.json()
-            guid = data.get('guid')
+        
+        try:
+            async with session.post(create_url, json={"title": display_name}, headers=headers) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    return None, f"Entry Creation Failed ({resp.status}): {error_text}"
+                
+                data = await resp.json()
+                guid = data.get('guid')
+        except Exception as e:
+            return None, f"Network Error during creation: {str(e)}"
 
-    # 2. Stream Upload (Disk to Web)
+    # --- STEP 2: STREAM BINARY CONTENT ---
+    # We use requests for the heavy binary upload as it handles disk-streaming more reliably
     try:
-        put_url = f"https://video.bunnycdn.com/library/{b_cfg['LIBRARY_ID']}/videos/{guid}"
+        upload_url = f"https://video.bunnycdn.com/library/{b_cfg['LIBRARY_ID']}/videos/{guid}"
+        upload_headers = {
+            "AccessKey": b_cfg['STREAM_KEY'],
+            "Content-Type": "application/octet-stream"
+        }
+        
         with open(local_path, 'rb') as f:
-            r = requests.put(put_url, data=f, headers={"AccessKey": b_cfg['STREAM_KEY']})
+            # This streams the file from disk directly to the network
+            r = requests.put(upload_url, data=f, headers=upload_headers)
+            
             if r.status_code == 200:
                 return guid, None
-            return None, f"Upload Error: {r.status_code}"
+            else:
+                return None, f"Upload Failed ({r.status_code}): {r.text}"
+                
     except Exception as e:
-        return None, str(e)
+        return None, f"Network Error during upload: {str(e)}"
