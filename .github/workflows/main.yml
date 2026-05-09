@@ -1,16 +1,16 @@
 name: Vault-Tree-Service
 
 on:
-  workflow_dispatch: # Manual start
+  workflow_dispatch: # Allows manual start from the Actions tab
   schedule:
-    - cron: '0 */6 * * *' # Auto-start every 6 hours
+    - cron: '0 */6 * * *' # Auto-starts every 6 hours
   push:
-    branches: [ main ] # Start on code updates
+    branches: [ main ] # Starts when you push code
 
 jobs:
   run-vault-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # Shuts down just before the 6-hour GitHub limit
+    timeout-minutes: 350 # Stops just before the 6-hour GitHub limit
 
     steps:
       - name: Checkout Repository
@@ -22,12 +22,14 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Increase Swap Space (For 2GB+ ZIPs)
+      - name: Cleanup and Optimize Disk
+        # This clears pre-installed tools we don't need to give you 
+        # the maximum possible space for your 2GB ZIPs.
         run: |
-          sudo fallocate -l 2G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - name: Install Dependencies
         run: |
