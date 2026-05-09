@@ -6,7 +6,6 @@ import time
 import asyncio
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession 
-from fast_telethon import download_file
 from dotenv import load_dotenv
 from utils import upload_local_file_to_bunny
 
@@ -40,7 +39,6 @@ def startup_cleanup():
 def build_tree(paths):
     tree = {}
     for path in paths:
-        # Ignore junk metadata often found in ZIPs
         if "__MACOSX" in path or ".DS_Store" in path:
             continue
         parts = path.split('/')
@@ -52,22 +50,18 @@ def build_tree(paths):
     return tree
 
 def get_tree_lines(tree, prefix="", number_prefix=""):
-    """Generates the visual list recursively without skipping depth."""
     lines = []
-    # Sort: Folders first, then Files alphabetically
     items = sorted(tree.items(), key=lambda x: (len(x[1]) == 0, x[0].lower()))
-    
     for i, (name, subtree) in enumerate(items, 1):
         num = f"{number_prefix}{i}"
-        if not subtree: # File
+        if not subtree:
             lines.append(f"{prefix}{num}. `{name}`")
-        else: # Folder
+        else:
             lines.append(f"{prefix}{num}. 📂 **{name}**")
             lines.extend(get_tree_lines(subtree, prefix + "    ", num + "."))
     return lines
 
 def get_path_map(tree, number_prefix="", current_path=""):
-    """Maps numbered indices back to the original internal ZIP paths."""
     mapping = {}
     items = sorted(tree.items(), key=lambda x: (len(x[1]) == 0, x[0].lower()))
     for i, (name, subtree) in enumerate(items, 1):
@@ -79,7 +73,7 @@ def get_path_map(tree, number_prefix="", current_path=""):
             mapping.update(get_path_map(subtree, num + ".", new_path))
     return mapping
 
-# --- PROGRESS CALLBACK (5s Intervals) ---
+# --- PROGRESS CALLBACK ---
 async def progress_callback(current, total, status_msg, start_time):
     now = time.time()
     if not hasattr(progress_callback, "last_update"):
@@ -90,11 +84,12 @@ async def progress_callback(current, total, status_msg, start_time):
 
     percent = (current / total) * 100
     cur_mb, tot_mb = current/(1024*1024), total/(1024*1024)
-    speed = cur_mb / (now - start_time) if (now - start_time) > 0 else 0
+    elapsed = now - start_time
+    speed = cur_mb / elapsed if elapsed > 0 else 0
     
     try:
         await status_msg.edit(
-            f"📥 **Turbo Download Active...**\n"
+            f"📥 **Downloading Vault...**\n"
             f"📊 **Progress:** `{percent:.1f}%`\n"
             f"📁 **Data:** `{cur_mb:.1f} / {tot_mb:.1f} MB`\n"
             f"⚡ **Speed:** `{speed:.2f} MB/s`"
@@ -106,34 +101,31 @@ async def progress_callback(current, total, status_msg, start_time):
 async def handler(event):
     # 1. PROCESS ZIP FILES
     if event.message.file and event.message.file.ext == ".zip":
-        status = await event.reply("📥 **Initializing Turbo Parallel Download...**")
+        status = await event.reply("📥 **Initializing High-Speed Download...**")
         start_time = time.time()
         
         try:
-            # Parallel Download via fast-telethon
-            with open("current_vault.zip", "wb") as f:
-                await download_file(
-                    client, 
-                    event.message.media, 
-                    f,
-                    progress_callback=lambda c, t: progress_callback(c, t, status, start_time)
-                )
+            # Native download with cryptg acceleration (if in requirements.txt)
+            local_zip = await client.download_media(
+                event.message,
+                "current_vault.zip",
+                progress_callback=lambda c, t: progress_callback(c, t, status, start_time)
+            )
             
-            await status.edit("📂 **Download Complete. Running Deep Scan...**")
+            await status.edit("📂 **Download Complete. Scanning Archive...**")
             
-            with zipfile.ZipFile("current_vault.zip", 'r') as z:
-                # Get all internal paths
+            with zipfile.ZipFile(local_zip, 'r') as z:
                 all_paths = [p for p in z.namelist() if not p.endswith('/') and "__MACOSX" not in p]
                 
                 tree = build_tree(all_paths)
                 all_lines = get_tree_lines(tree)
                 path_map = get_path_map(tree)
-                active_sessions[event.chat_id] = {"zip": "current_vault.zip", "map": path_map}
+                active_sessions[event.chat_id] = {"zip": local_zip, "map": path_map}
                 
                 await status.delete()
-                await event.respond(f"🌳 **File Tree ({len(all_paths)} items found):**\n━━━━━━━━━━━━━━━━━━━━")
+                await event.respond(f"✅ **Scan Complete!**\n📦 Total Items: `{len(all_paths)}`\n━━━━━━━━━━━━━━━━━━━━")
                 
-                # Send chunks of 25 lines to avoid Telegram character limits/skipping
+                # Chunked messaging to avoid Telegram character limits
                 for i in range(0, len(all_lines), 25):
                     await event.respond("\n".join(all_lines[i : i + 25]))
                 
