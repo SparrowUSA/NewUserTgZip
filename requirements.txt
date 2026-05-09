@@ -1,4 +1,5 @@
 telethon
+fast-telethon
 requests
 aiohttp
 python-dotenv
