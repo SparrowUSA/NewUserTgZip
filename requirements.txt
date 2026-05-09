@@ -1,5 +1,4 @@
 telethon
 aiohttp
-stream-unzip
-python-dotenv
 requests
+python-dotenv
